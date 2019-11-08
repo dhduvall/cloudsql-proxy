@@ -17,14 +17,28 @@ package proxy
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/fsnotify/fsnotify"
+
+	"golang.org/x/net/context"
+	"golang.org/x/oauth2"
+	goauth "golang.org/x/oauth2/google"
 )
 
 const (
@@ -38,6 +52,10 @@ var (
 	// user.
 	errNotCached      = errors.New("instance was not found in cache")
 	refreshCertBuffer = 30 * time.Second
+
+	token            string
+	tokenFile        string
+	credFileModified time.Time
 )
 
 // Conn represents a connection from a client to a specific instance.
@@ -53,6 +71,7 @@ type CertSource interface {
 	Local(instance string) (tls.Certificate, error)
 	// Remote returns the instance's CA certificate, address, and name.
 	Remote(instance string) (cert *x509.Certificate, addr, name string, err error)
+	ResetClient(c *http.Client)
 }
 
 // Client is a type to handle connecting to a Server. All fields are required
@@ -184,13 +203,34 @@ func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err 
 		c.cacheL.Unlock()
 	}()
 
-	mycert, err := c.Certs.Local(instance)
-	if err != nil {
-		return "", nil, err
+	var mycert tls.Certificate
+	for {
+		mycert, err = c.Certs.Local(instance)
+		if err == nil {
+			break
+		}
+
+		if !IsInvalidJWTError(err) {
+			logging.Infof("Unexpected error in Certs.Local(): %T %v", err, err)
+			spew.Config.ContinueOnMethod = true
+			spew.Dump(err)
+			return "", nil, err
+		}
+
+		for {
+			client, err := AuthenticatedClient(context.Background())
+			if err != nil {
+				WaitForCredentialFileChange()
+				continue
+			}
+			c.Certs.ResetClient(client)
+			break
+		}
 	}
 
 	scert, addr, name, err := c.Certs.Remote(instance)
 	if err != nil {
+		logging.Infof("Certs.Remote() error: %T %v", err, err)
 		return "", nil, err
 	}
 	certs := x509.NewCertPool()
@@ -224,12 +264,13 @@ func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err 
 	return fmt.Sprintf("%s:%d", addr, c.Port), cfg, nil
 }
 
-// refreshCertAfter refreshes the epehemeral certificate of the instance after timeToRefresh.
+// refreshCertAfter refreshes the ephemeral certificate of the instance after timeToRefresh.
 func (c *Client) refreshCertAfter(instance string, timeToRefresh time.Duration) {
+	logging.Infof("Waiting %s to refresh cert", timeToRefresh)
 	<-time.After(timeToRefresh)
 	logging.Verbosef("ephemeral certificate for instance %s will expire soon, refreshing now.", instance)
 	if _, _, err := c.refreshCfg(instance); err != nil {
-		logging.Errorf("failed to refresh the ephemeral certificate for %s before expering: %v", instance, err)
+		logging.Errorf("failed to refresh the ephemeral certificate for %s before expiring: %v", instance, err)
 	}
 }
 
@@ -368,4 +409,185 @@ func (c *Client) Shutdown(termTimeout time.Duration) error {
 		return nil
 	}
 	return fmt.Errorf("%d active connections still exist after waiting for %v", active, termTimeout)
+}
+
+func AuthenticatedClientFromPath(ctx context.Context, f string) (*http.Client, error) {
+	fileInfo, err := os.Stat(f)
+	if err != nil {
+		return nil, fmt.Errorf("invalid json file %q: %v", f, err)
+	}
+	credFileModified = fileInfo.ModTime()
+	logging.Infof("Got credentials file modification time: %s", credFileModified)
+
+	all, err := ioutil.ReadFile(f)
+	if err != nil {
+		return nil, fmt.Errorf("invalid json file %q: %v", f, err)
+	}
+	// First try and load this as a service account config, which allows us to see the service account email:
+	if cfg, err := goauth.JWTConfigFromJSON(all, SQLScope); err == nil {
+		logging.Infof("using credential file for authentication; email=%s; private_key_id=%s",
+			cfg.Email, cfg.PrivateKeyID)
+		return cfg.Client(ctx), nil
+	}
+
+	cred, err := goauth.CredentialsFromJSON(ctx, all, SQLScope)
+	if err != nil {
+		return nil, fmt.Errorf("invalid json file %q: %v", f, err)
+	}
+	logging.Infof("using credential file for authentication; path=%q", f)
+	return oauth2.NewClient(ctx, cred.TokenSource), nil
+}
+
+func AuthenticatedClient(ctx context.Context) (*http.Client, error) {
+	if tokenFile != "" {
+		return AuthenticatedClientFromPath(ctx, tokenFile)
+	} else if tok := token; tok != "" {
+		src := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok})
+		return oauth2.NewClient(ctx, src), nil
+	} else if f := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); f != "" {
+		return AuthenticatedClientFromPath(ctx, f)
+	}
+
+	// If flags or env don't specify an auth source, try either gcloud or application default
+	// credentials.
+	src, err := util.GcloudTokenSource(ctx)
+	if err != nil {
+		src, err = goauth.DefaultTokenSource(ctx, SQLScope)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return oauth2.NewClient(ctx, src), nil
+}
+
+func waitForFileChange(f string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logging.Fatalf("%v", err)
+	}
+	defer watcher.Close()
+
+	// Watching the directory where a symlink lives won't help if the file
+	// is changed in the directory where it really lives, so find that
+	// directory.  Note that this still doesn't work if any symlink in the
+	// chain is changed.
+	rf, err := filepath.EvalSymlinks(f)
+	if err != nil {
+		cont := false
+		if perr, ok := err.(*os.PathError); ok {
+			if eerr, ok := perr.Err.(syscall.Errno); ok {
+				if eerr == syscall.ENOENT {
+					rf = f
+					cont = true
+				}
+			}
+		}
+		if !cont {
+			logging.Fatalf("%v", err)
+		}
+	}
+	if splitDir, _ := filepath.Split(rf); splitDir == "" {
+		rf = "./" + rf
+	}
+	logging.Infof("got %s, evaled to %s", f, rf)
+
+	done := make(chan bool)
+	abort := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-abort:
+				return
+			case event, ok := <-watcher.Events:
+				if !ok {
+					done <- true
+					return
+				}
+				if event.Name != rf {
+					logging.Infof("Got event for %s; don't care", event.Name)
+					continue
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					logging.Infof("%s got written", event.Name)
+					done <- true
+					return
+				} else if event.Op&fsnotify.Create == fsnotify.Create {
+					logging.Infof("%s got created", event.Name)
+					done <- true
+					return
+				} else if event.Op&fsnotify.Remove == fsnotify.Remove {
+					logging.Infof("%s got removed", event.Name)
+				} else if event.Op&fsnotify.Rename == fsnotify.Rename {
+					logging.Infof("%s got renamed", event.Name)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					done <- true
+					return
+				}
+				logging.Infof("Got error: %v", err)
+			}
+		}
+	}()
+
+	if err = watcher.Add(filepath.Dir(rf)); err != nil {
+		logging.Fatalf("%v", err)
+	}
+
+	if fileInfo, err := os.Stat(f); err == nil && fileInfo.ModTime().After(credFileModified) {
+		logging.Infof("Credentials file modified since last checked; aborting wait: %s > %s",
+			fileInfo.ModTime(), credFileModified)
+		abort <- true
+		return
+	}
+	<-done
+}
+
+func WaitForCredentialFileChange() {
+	var authFile string
+
+	if tokenFile != "" {
+		authFile = tokenFile
+	} else if token != "" {
+		authFile = ""
+	} else if gac := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); gac != "" {
+		authFile = gac
+	} else {
+		authFile = ""
+	}
+
+	if authFile == "" {
+		logging.Fatalf("Credentials don't come from a file which can be monitored")
+	}
+
+	waitForFileChange(authFile)
+}
+
+func IsInvalidJWTError(err error) bool {
+	uerr, ok := err.(*url.Error)
+	if !ok {
+		return false
+	}
+	rerr, ok := uerr.Err.(*oauth2.RetrieveError)
+	if !ok {
+		return false
+	}
+	resp := rerr.Response
+	if resp.StatusCode == http.StatusBadRequest {
+		var bodyMap map[string]string
+		if err := json.Unmarshal(rerr.Body, &bodyMap); err != nil {
+			return false
+		}
+		if bodyMap["error"] != "invalid_grant" {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func SetGlobals(tkFile string, tk string) {
+	tokenFile = tkFile
+	token = tk
 }

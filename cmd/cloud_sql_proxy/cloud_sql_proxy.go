@@ -43,8 +43,6 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"golang.org/x/net/context"
-	"golang.org/x/oauth2"
-	goauth "golang.org/x/oauth2/google"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
 
@@ -271,48 +269,6 @@ func checkFlags(onGCE bool) error {
 	return nil
 }
 
-func authenticatedClientFromPath(ctx context.Context, f string) (*http.Client, error) {
-	all, err := ioutil.ReadFile(f)
-	if err != nil {
-		return nil, fmt.Errorf("invalid json file %q: %v", f, err)
-	}
-	// First try and load this as a service account config, which allows us to see the service account email:
-	if cfg, err := goauth.JWTConfigFromJSON(all, proxy.SQLScope); err == nil {
-		logging.Infof("using credential file for authentication; email=%s", cfg.Email)
-		return cfg.Client(ctx), nil
-	}
-
-	cred, err := goauth.CredentialsFromJSON(ctx, all, proxy.SQLScope)
-	if err != nil {
-		return nil, fmt.Errorf("invalid json file %q: %v", f, err)
-	}
-	logging.Infof("using credential file for authentication; path=%q", f)
-	return oauth2.NewClient(ctx, cred.TokenSource), nil
-}
-
-func authenticatedClient(ctx context.Context) (*http.Client, error) {
-	if *tokenFile != "" {
-		return authenticatedClientFromPath(ctx, *tokenFile)
-	} else if tok := *token; tok != "" {
-		src := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: tok})
-		return oauth2.NewClient(ctx, src), nil
-	} else if f := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); f != "" {
-		return authenticatedClientFromPath(ctx, f)
-	}
-
-	// If flags or env don't specify an auth source, try either gcloud or application default
-	// credentials.
-	src, err := util.GcloudTokenSource(ctx)
-	if err != nil {
-		src, err = goauth.DefaultTokenSource(ctx, proxy.SQLScope)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return oauth2.NewClient(ctx, src), nil
-}
-
 func stringList(s string) []string {
 	spl := strings.Split(s, ",")
 	if len(spl) == 1 && spl[0] == "" {
@@ -458,20 +414,39 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ctx := context.Background()
-	client, err := authenticatedClient(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
+	proxy.SetGlobals(*tokenFile, *token)
 
-	ins, err := listInstances(ctx, client, projList)
-	if err != nil {
-		log.Fatal(err)
-	}
-	instList = append(instList, ins...)
-	cfgs, err := CreateInstanceConfigs(*dir, *useFuse, instList, *instanceSrc, client)
-	if err != nil {
-		log.Fatal(err)
+	ctx := context.Background()
+	var client *http.Client
+	var ins []string
+	var cfgs []instanceConfig
+	var err error
+	for {
+		client, err = proxy.AuthenticatedClient(ctx)
+		if err != nil {
+			proxy.WaitForCredentialFileChange()
+			continue
+		}
+
+		ins, err = listInstances(ctx, client, projList)
+		if err != nil {
+			log.Fatal(err)
+		}
+		instList = append(instList, ins...)
+		cfgs, err = CreateInstanceConfigs(*dir, *useFuse, instList, *instanceSrc, client)
+		// CreateInstanceConfigs() eventually calls sqladmin.New() with
+		// client, and that's what can fail here.
+		if perr, ok := err.(picError); ok {
+			if proxy.IsInvalidJWTError(perr.errs[0]) {
+				proxy.WaitForCredentialFileChange()
+				continue
+			} else {
+				log.Fatal(err)
+			}
+		} else if err != nil {
+			log.Fatal(err)
+		}
+		break
 	}
 
 	// We only need to store connections in a ConnSet if FUSE is used; otherwise

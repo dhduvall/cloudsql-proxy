@@ -31,6 +31,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/util"
+	// "github.com/davecgh/go-spew/spew"
 	"google.golang.org/api/googleapi"
 	sqladmin "google.golang.org/api/sqladmin/v1beta4"
 )
@@ -108,6 +109,16 @@ func NewCertSourceOpts(c *http.Client, opts RemoteOpts) *RemoteCertSource {
 	return &RemoteCertSource{pkey, serv, !opts.IgnoreRegion, opts.IPAddrTypeOpts}
 }
 
+func (s *RemoteCertSource) ResetClient(c *http.Client) {
+	serv, err := sqladmin.New(c)
+	if err != nil {
+		panic(err)
+	}
+	serv.BasePath = s.serv.BasePath
+	serv.UserAgent = s.serv.UserAgent
+	s.serv = serv
+}
+
 // RemoteCertSource implements a CertSource, using Cloud SQL APIs to
 // return Local certificates for identifying oneself as a specific user
 // to the remote instance and Remote certificates for confirming the
@@ -137,6 +148,11 @@ func backoffAPIRetry(desc, instance string, do func() error) error {
 	var err error
 	for i := 0; i < backoffRetries; i++ {
 		err = do()
+		if err != nil {
+			logging.Errorf("Err in backoffAPIRetry: %T %v", err, err)
+			// spew.Config.ContinueOnMethod = true
+			// spew.Dump(err)
+		}
 		gErr, ok := err.(*googleapi.Error)
 		switch {
 		case !ok:
@@ -179,6 +195,9 @@ func (s *RemoteCertSource) Local(instance string) (ret tls.Certificate, err erro
 	var data *sqladmin.SslCert
 	err = backoffAPIRetry("createEphemeral for", instance, func() error {
 		data, err = req.Do()
+		if err != nil {
+			logging.Errorf("Err in certs.Local/backoffAPIRetry(): %T %v", err, err)
+		}
 		return err
 	})
 	if err != nil {

@@ -32,6 +32,9 @@ var Infof = log.Printf
 // Errorf is called to write an error log, such as when a new connection fails.
 var Errorf = log.Printf
 
+// Fatalf is called to write a log and exit the program.
+var Fatalf = log.Fatalf
+
 // LogDebugToStdout updates Verbosef and Info logging to use stdout instead of stderr.
 func LogDebugToStdout() {
 	logger := log.New(os.Stdout, "", log.LstdFlags)

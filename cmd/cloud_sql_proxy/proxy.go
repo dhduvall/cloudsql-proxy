@@ -306,24 +306,43 @@ func parseTCPOpts(ntwk, addrOpt string) (string, error) {
 // provided slice, collecting errors along the way. There may be valid
 // instanceConfigs returned even if there's an error.
 func parseInstanceConfigs(dir string, instances []string, cl *http.Client) ([]instanceConfig, error) {
-	errs := new(bytes.Buffer)
+	var errs picError
 	var cfg []instanceConfig
 	for _, v := range instances {
 		if v == "" {
 			continue
 		}
 		if c, err := parseInstanceConfig(dir, v, cl); err != nil {
-			fmt.Fprintf(errs, "\n\t%v", err)
+			errs.Add(err)
 		} else {
 			cfg = append(cfg, c)
 		}
 	}
 
-	var err error
-	if errs.Len() > 0 {
-		err = fmt.Errorf("errors parsing config:%s", errs)
+	if errs.Len() == 0 {
+		return cfg, nil
 	}
-	return cfg, err
+	return cfg, errs
+}
+
+type picError struct {
+	errs []error
+}
+
+func (me picError) Error() string {
+	errs := new(bytes.Buffer)
+	for _, e := range me.errs {
+		fmt.Fprintf(errs, "\n\t%v", e)
+	}
+	return errs.String()
+}
+
+func (me *picError) Add(err error) {
+	me.errs = append(me.errs, err)
+}
+
+func (me *picError) Len() int {
+	return len(me.errs)
 }
 
 // CreateInstanceConfigs verifies that the parameters passed to it are valid
